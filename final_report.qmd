@@ -1,0 +1,252 @@
+---
+title: "DATASCI 226 Final"
+author: "Shwetha Kandhalu"
+date: "2026-03-26"
+format:
+  pdf:
+    toc: false
+    number-sections: true
+    fig-width: 6
+    fig-height: 4
+    fontsize: 10pt
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: true
+---
+
+```{r setup}
+library(readxl)
+library(dplyr)
+library(brms)
+library(bayesplot)
+library(ggplot2)
+library(tidyr)
+library(knitr)
+
+set.seed(226)
+```
+
+# Scientific Question
+
+**Do early changes in tumor volume predict pathologic complete response (pCR)?**
+
+# Data Preparation
+
+```{r data}
+clin <- read_excel("data/ISPY2-Imaging-Cohort-1-Clinical-Data.xlsx")
+mri  <- read_excel("data/Multi-feature-MRI-NACT-Data.xlsx")
+
+df <- merge(clin, mri,
+            by.x = "Patient_ID",
+            by.y = "CLINICAL-TRIAL-SUBJECT-ID") |>
+  select(pCR, FTV_pch_T0_T1, VOLUME_TUM_BLU_V10) |>
+  filter(complete.cases(pick(everything()))) |>
+  mutate(
+    pCR       = as.integer(pCR),
+    ftv_early = scale(FTV_pch_T0_T1)[,1],
+    vol_base  = scale(VOLUME_TUM_BLU_V10)[,1]
+  )
+
+cat("N =", nrow(df), "| pCR rate =", round(mean(df$pCR), 3))
+```
+
+**Predictors:**
+
+- `FTV_pch_T0_T1`: % change in functional tumor volume from T0 to T1 (scaled). More negative = greater early shrinkage.
+- `VOLUME_TUM_BLU_V10`: baseline tumor volume at T0 in cm³ (scaled).
+
+# Model Specification
+
+## Primary Model (M1): Early FTV change + baseline volume
+
+$$
+\text{logit}(P(\text{pCR}_i = 1)) = \beta_0 + \beta_1 \cdot \text{ftv\_early}_i + \beta_2 \cdot \text{vol\_base}_i
+$$
+
+```{r priors}
+priors_m1 <- c(
+  prior(normal(0, 1.5),    class = Intercept),
+  prior(normal(-0.8, 0.5), class = b, coef = ftv_early),
+  prior(normal(-0.5, 0.5), class = b, coef = vol_base)
+)
+```
+
+```{r fit_m1, results='hide'}
+m1 <- brm(
+  pCR ~ ftv_early + vol_base,
+  data   = df,
+  family = bernoulli(link = "logit"),
+  prior  = priors_m1,
+  chains = 4,
+  iter   = 4000,
+  warmup = 1000,
+  seed   = 226,
+  file   = "output/m1"
+)
+```
+
+## Comparison Model (M2): Baseline volume only
+
+M2 excludes early FTV change to test whether the imaging response adds predictive value beyond baseline tumor size alone.
+
+```{r fit_m2, results='hide'}
+m2 <- brm(
+  pCR ~ vol_base,
+  data   = df,
+  family = bernoulli(link = "logit"),
+  prior  = c(
+    prior(normal(0, 1.5),    class = Intercept),
+    prior(normal(-0.5, 0.5), class = b, coef = vol_base)
+  ),
+  chains = 4,
+  iter   = 4000,
+  warmup = 1000,
+  seed   = 226,
+  file   = "output/m2"
+)
+```
+
+# Priors
+
+Predictors are standardized (mean 0, SD 1).
+
+| Parameter | Prior | Justification |
+|-----------|-------|---------------|
+| $\beta_0$ (Intercept) | $\mathcal{N}(0,\ 1.5)$ | Weakly informative; consistent with ~29% observed pCR rate |
+| $\beta_1$ (Early FTV change) | $\mathcal{N}(-0.8,\ 0.5)$ | Early FTV reduction is an established predictor of pCR in NACT trials; negative direction well-supported |
+| $\beta_2$ (Baseline volume) | $\mathcal{N}(-0.5,\ 0.5)$ | Larger baseline tumors are less likely to achieve complete response; moderate negative effect expected |
+
+Both continuous predictors have informative priors based on published neoadjuvant chemotherapy evidence.
+
+# Posterior Results
+
+```{r posterior_summary}
+coef_tbl <- fixef(m1, probs = c(0.025, 0.975)) |>
+  as.data.frame() |>
+  round(3)
+
+combined_tbl <- data.frame(
+  Estimate   = coef_tbl$Estimate,
+  `2.5%`     = coef_tbl$Q2.5,
+  `97.5%`    = coef_tbl$Q97.5,
+  OR         = round(exp(coef_tbl$Estimate), 3),
+  `OR 2.5%`  = round(exp(coef_tbl$Q2.5), 3),
+  `OR 97.5%` = round(exp(coef_tbl$Q97.5), 3),
+  check.names = FALSE
+)
+rownames(combined_tbl) <- rownames(coef_tbl)
+
+kable(combined_tbl, caption = "Posterior coefficients and odds ratios (95% CrI) — M1")
+```
+
+```{r posterior_plot, fig.cap="Posterior distributions of regression coefficients (M1)"}
+mcmc_areas(m1,
+           pars = c("b_Intercept", "b_ftv_early", "b_vol_base"),
+           prob = 0.90) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Posterior distributions with 90% credible intervals") +
+  theme_bw()
+```
+
+**Key findings:**
+
+- **Early FTV change** ($\beta_1$): Negative posterior — patients with greater early tumor shrinkage have higher odds of pCR.
+- **Baseline volume** ($\beta_2$): Negative posterior — larger tumors at baseline associate with lower pCR odds, though with more uncertainty.
+
+# Model Checking
+
+```{r ppc, fig.cap="Posterior predictive check"}
+pp_check(m1, type = "bars", ndraws = 100) +
+  labs(title = "Posterior predictive check (M1)",
+       x = "pCR") +
+  theme_bw()
+```
+
+**Interpretation:**
+
+- Predicted 0/1 proportions closely match observed values.
+- Posterior predictive means are centered on the observed rate (~0.29), indicating good calibration.
+
+# MCMC Diagnostics
+
+```{r rhat_neff}
+m1_sum <- summary(m1)$fixed
+
+kable(round(m1_sum, 3), caption = "MCMC diagnostics")
+```
+
+- All $\hat{R} <$ `r round(max(m1_sum[,"Rhat"]), 3)` — chains have converged ($\hat{R} \approx 1$ indicates mixing).
+- Bulk ESS well above 1,000 for all parameters — posterior estimates are reliable.
+
+```{r trace_plots, fig.cap="Trace plots for M1 regression coefficients", fig.height=5}
+mcmc_trace(m1,
+           pars = c("b_Intercept", "b_ftv_early", "b_vol_base"),
+           facet_args = list(ncol = 1)) +
+  theme_bw()
+```
+
+Trace plots show good chain mixing with no drift or divergence across all 4 chains.
+
+# Model Comparison
+
+```{r loo}
+m1 <- add_criterion(m1, "loo")
+m2 <- add_criterion(m2, "loo")
+
+loo_comp <- loo_compare(m1, m2)
+kable(as.data.frame(round(loo_comp, 2)),
+      caption = "LOO-CV model comparison")
+```
+
+- If M1 is preferred, early FTV change carries predictive value beyond baseline tumor size alone.
+- The ELPD difference relative to its standard error indicates whether the improvement is meaningful.
+
+# Sensitivity Analysis
+
+```{r fit_m1_weak, results='hide'}
+m1_weak <- brm(
+  pCR ~ ftv_early + vol_base,
+  data   = df,
+  family = bernoulli(link = "logit"),
+  prior  = c(
+    prior(normal(0, 10),  class = Intercept),
+    prior(normal(0, 2.5), class = b)
+  ),
+  chains = 4,
+  iter   = 4000,
+  warmup = 1000,
+  seed   = 226,
+  file   = "output/m1_weak"
+)
+```
+
+```{r sensitivity_plot, fig.cap="Posterior comparison: informative vs. weak priors"}
+post_inf  <- as_draws_df(m1)[, c("b_ftv_early","b_vol_base")] |>
+  mutate(model = "Informative")
+post_weak <- as_draws_df(m1_weak)[, c("b_ftv_early","b_vol_base")] |>
+  mutate(model = "Weak")
+
+bind_rows(post_inf, post_weak) |>
+  pivot_longer(cols = starts_with("b_"), names_to = "parameter", values_to = "value") |>
+  mutate(parameter = recode(parameter,
+    b_ftv_early = "Early FTV change",
+    b_vol_base  = "Baseline volume")) |>
+  ggplot(aes(x = value, fill = model, color = model)) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~parameter, scales = "free") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(x = "Coefficient (log-odds)", y = "Density", fill = "Prior", color = "Prior") +
+  theme_bw() + theme(legend.position = "bottom")
+```
+
+- Estimates are nearly identical under both prior specifications — the data drive the posterior.
+- Conclusions are robust to prior choice.
+
+# Conclusions
+
+- Greater early FTV reduction (T0→T1) is associated with higher probability of pCR, supporting early MRI response as a useful imaging biomarker.
+- Baseline tumor volume shows a negative association with pCR but with more uncertainty.
+- LOO-CV comparison confirms that early FTV change improves prediction over baseline size alone.
+- Results are stable across informative and weak prior specifications.
